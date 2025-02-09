@@ -1,0 +1,883 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Resources:
+  # S3 Bucket for Frontend Hosting
+  FrontendS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: my-library-frontend-bucket-sheshan-hebron
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+
+  # DynamoDB Table for Library Data
+  LibraryDynamoDB:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: LibraryTable1
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  # -------------------- SNS Topic --------------------
+  CICDSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: CICD-Success-Notification
+  
+  # -------------------- SNS Subscription (Email) --------------------
+  CICDSNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref CICDSNSTopic
+      Protocol: email
+      Endpoint: "sheshanhebron61@gmail.com"  # Replace with your email
+
+  # -------------------- IAM Role for Lambda --------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaSNSExecutionRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - lambda.amazonaws.com
+            Action: 
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaSNSPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref CICDSNSTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+
+              - Effect: Allow
+                Action:
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetApplication
+                  - codedeploy:GetDeploymentGroup
+                Resource: "*"
+
+  # CloudWatch Event Rule for CodeDeploy Events
+  DeploymentEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: CodeDeployStatusChangeRule
+      Description: "Rule to capture CodeDeploy deployment status changes"
+      EventPattern:
+        source:
+          - aws.codedeploy
+        detail-type:
+          - CodeDeploy Deployment State-change Notification
+        detail:
+          deploymentId:
+          - exists: true  # ✅ Ensure deploymentId is included
+          state:
+            - SUCCESS
+            - FAILURE
+            - STOP
+            - ROLLBACK
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CICDNotificationLambda.Arn
+          Id: "DeploymentNotificationTarget"
+
+
+  # Lambda Permission for CloudWatch Events
+  DeploymentLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CICDNotificationLambda
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt DeploymentEventRule.Arn
+
+  # -------------------- Lambda Function --------------------
+  CICDNotificationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CICDNotificationLambda
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              print("Received event:", json.dumps(event, default=str))
+              
+              sns_client = boto3.client('sns')
+              codedeploy = boto3.client('codedeploy')
+              
+              try:
+                  # Get deployment details
+                  detail = event.get('detail', {})
+                  status = detail.get('state', 'UNKNOWN')
+                  deployment_id = detail.get('deploymentId', 'UNKNOWN')
+                  application = detail.get('application', 'Unknown')
+                  
+                  print(f"Processing deployment: {deployment_id}, Status: {status}, App: {application}")
+                  
+                  try:
+                      # Get additional deployment info
+                      deployment = codedeploy.get_deployment(deploymentId=deployment_id)
+                      deployment_info = deployment['deploymentInfo']
+                      print(f"Deployment info retrieved: {json.dumps(deployment_info, default=str)}")
+                      
+                      # Create message
+                      message = f"""
+                      Deployment Status Update
+                      
+                      Status: {status}
+                      Application: {application}
+                      Deployment ID: {deployment_id}
+                      Deployment Group: {deployment_info.get('deploymentGroupName', 'N/A')}
+                      Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+                      
+                      Status Details: {deployment_info.get('status', 'N/A')}
+                      
+                      Additional Information:
+                      - Deployment Type: {deployment_info.get('deploymentStyle', {}).get('deploymentType', 'N/A')}
+                      - Deployment Option: {deployment_info.get('deploymentStyle', {}).get('deploymentOption', 'N/A')}
+                      
+                      Please check AWS Console for more details.
+                      """
+                      
+                      print(f"Attempting to send SNS message to topic: {os.environ['SNS_TOPIC_ARN']}")
+                      
+                      # Send notification
+                      response = sns_client.publish(
+                          TopicArn=os.environ['SNS_TOPIC_ARN'],
+                          Message=message,
+                          Subject=f"Deployment {status} - {application}"
+                      )
+                      
+                      print(f"SNS publish response: {json.dumps(response, default=str)}")
+                      
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps('Notification sent successfully')
+                      }
+                      
+                  except codedeploy.exceptions.DeploymentDoesNotExistException:
+                      error_msg = f"Deployment {deployment_id} not found"
+                      print(error_msg)
+                      raise Exception(error_msg)
+                      
+              except Exception as e:
+                  error_msg = f"Error processing deployment notification: {str(e)}"
+                  print(error_msg)
+                  
+                  try:
+                      # Send error notification
+                      sns_client.publish(
+                          TopicArn=os.environ['SNS_TOPIC_ARN'],
+                          Message=f"""
+                          Error in Deployment Notification
+                          
+                          Error Details: {error_msg}
+                          
+                          Please check AWS Console and CloudWatch logs for more information.
+                          """,
+                          Subject=f"Error - Deployment Notification"
+                      )
+                  except Exception as sns_error:
+                      print(f"Error sending error notification: {str(sns_error)}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': error_msg})
+                  }
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref CICDSNSTopic
+
+  # Security Group for EC2 Instances
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP and SSH access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  EC2SecurityGroupForBackEnd:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP (5000) from ALBBackend only
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          SourceSecurityGroupId: !GetAtt EC2SecurityGroupForBackEndALB.GroupId
+
+  EC2SecurityGroupForBackEndALB:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow traffic from Frontend EC2s only
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+  
+  LibraryEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LibraryEC2Role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - ec2.amazonaws.com
+            Action: 
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole
+      Policies:
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - "arn:aws:s3:::my-library-frontend-bucket-sheshan-hebron/*"
+
+                # DynamoDB Full Access Policy
+              - Effect: Allow
+                Action:
+                  - dynamodb:*
+                Resource: 
+                  - !GetAtt LibraryDynamoDB.Arn
+        
+
+  LibraryInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: LibraryInstanceProfile
+      Roles:
+        - !Ref LibraryEC2Role
+
+  # Launch Template for Auto Scaling Group
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: LibraryLaunchTemplate
+      VersionDescription: Initial Version
+      LaunchTemplateData:
+        ImageId: ami-0c614dee691cbbf37  # Update AMI for your region
+        InstanceType: t2.micro
+        IamInstanceProfile:
+          Name: !Ref LibraryInstanceProfile
+        SecurityGroupIds:
+          - !GetAtt EC2SecurityGroup.GroupId  # ✅ Correct way to reference Security Group ID
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            sudo yum update -y
+            sudo yum install git -y
+            sudo yum install nodejs -y
+            sudo yum install npm -y
+            sudo yum install ruby wget -y
+            sudo amazon-linux-extras enable epel
+            sudo yum install epel-release -y
+            cd /home/ec2-user
+            wget https://aws-codedeploy-us-east-1.s3.us-east-1.amazonaws.com/latest/install
+            chmod +x install
+            sudo ./install auto
+            sudo service codedeploy-agent start
+            sudo systemctl enable codedeploy-agent
+            sudo yum install -y httpd
+            sudo service httpd start
+            sudo systemctl enable httpd
+
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: LibraryEC2
+  
+  LaunchTemplateForBackEnd:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: LibraryLaunchTemplateForBackEnd
+      VersionDescription: Initial Version
+      LaunchTemplateData:
+        ImageId: ami-0c614dee691cbbf37  # Update AMI for your region
+        InstanceType: t2.micro
+        IamInstanceProfile:
+          Name: !Ref LibraryInstanceProfile
+        SecurityGroupIds:
+          - !GetAtt EC2SecurityGroupForBackEnd.GroupId  # ✅ Correct way to reference Security Group ID
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            sudo yum update -y
+            sudo yum install git -y
+            sudo yum install nodejs -y
+            sudo yum install npm -y
+            sudo yum install ruby wget -y
+            sudo amazon-linux-extras enable epel
+            sudo yum install epel-release -y
+            cd /home/ec2-user
+            wget https://aws-codedeploy-us-east-1.s3.us-east-1.amazonaws.com/latest/install
+            chmod +x install
+            sudo ./install auto
+            sudo service codedeploy-agent start
+            sudo systemctl enable codedeploy-agent
+            sudo yum install -y httpd
+            sudo service httpd start
+            sudo systemctl enable httpd
+
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: LibraryEC2ForBackEnd
+
+
+  
+
+  # Auto Scaling Group
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: '2'
+      MaxSize: '5'
+      DesiredCapacity: '2'
+      VPCZoneIdentifier:
+        - subnet-0e873e785de68682d # Replace with your subnet ID
+        - subnet-0c6bc9756cd950755
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+
+  # Auto Scaling Group
+  AutoScalingBackEndGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: '2'
+      MaxSize: '5'
+      DesiredCapacity: '2'
+      VPCZoneIdentifier:
+        - subnet-0e873e785de68682d # Replace with your subnet ID
+        - subnet-0c6bc9756cd950755
+      TargetGroupARNs:
+        - !Ref ALBTargetBackEndGroup
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplateForBackEnd
+        Version: !GetAtt LaunchTemplateForBackEnd.LatestVersionNumber
+
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: LibraryALB
+      Scheme: internet-facing
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+      SecurityGroups:
+        - !GetAtt EC2SecurityGroup.GroupId 
+      Subnets:
+        - subnet-0e873e785de68682d # Replace with your subnet ID
+        - subnet-0c6bc9756cd950755
+  
+  ApplicationLoadBalancerForBackEnd:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: LibraryALBForBackEnd
+      Scheme: internet-facing
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+      SecurityGroups:
+        - !GetAtt EC2SecurityGroupForBackEndALB.GroupId 
+      Subnets:
+        - subnet-0e873e785de68682d # Replace with your subnet ID
+        - subnet-0c6bc9756cd950755
+
+  # Target Group for ALB
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: vpc-03bb2a2ae6d53f14e # Replace with your actual VPC ID
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+
+  ALBTargetBackEndGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: vpc-03bb2a2ae6d53f14e # Replace with your actual VPC ID
+      Protocol: HTTP
+      Port: 5000
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: "5000"
+      HealthCheckPath: "/health"
+
+
+  # ALB Listener
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+  
+  ALBListenerForBackend:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancerForBackEnd
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetBackEndGroup
+
+
+  LibraryCodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CodePipelineRole7
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelinePermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # ✅ Allow access to ALL CodeDeploy deployment configs
+              - Effect: Allow
+                Action:
+                  - codedeploy:GetDeploymentConfig
+                  - codedeploy:GetApplicationRevision
+                Resource:
+                  - "arn:aws:codedeploy:us-east-1:583966366465:deploymentconfig:*"  # ✅ Changed to wildcard for all deployment configs
+
+              # ✅ Allow CodeDeploy actions for deployments
+              - Effect: Allow
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetDeployment
+                  - codedeploy:RegisterApplicationRevision
+                  - codedeploy:GetApplication
+                  - codedeploy:GetDeploymentGroup
+                Resource:
+                  - "arn:aws:codedeploy:us-east-1:583966366465:application:LibraryApp"
+                  - "arn:aws:codedeploy:us-east-1:583966366465:application:LibraryBackApp"
+                  - "arn:aws:codedeploy:us-east-1:583966366465:deploymentgroup:LibraryApp/LibraryDeploymentGroup"
+                  - "arn:aws:codedeploy:us-east-1:583966366465:deploymentgroup:LibraryBackApp/LibraryDeploymentGroupBackend"
+                  
+
+              # ✅ Allow CodeBuild permissions
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource:
+                  - "arn:aws:codebuild:us-east-1:583966366465:project/LibraryCodeBuild"
+                  - "arn:aws:codebuild:us-east-1:583966366465:project/LibraryCodeBuildBackend"
+
+              # ✅ Allow CodePipeline permissions
+              - Effect: Allow
+                Action:
+                  - codepipeline:PutJobSuccessResult
+                  - codepipeline:PutJobFailureResult
+                Resource: "*"
+
+              # ✅ Allow S3 access
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${FrontendS3Bucket}"
+                  - !Sub "arn:aws:s3:::${FrontendS3Bucket}/*"
+
+              - Effect: Allow 
+                Action: 
+                  - lambda:InvokeFunction
+                Resource: !GetAtt CICDNotificationLambda.Arn
+
+              # ✅ Allow CodeStar Connections (for GitHub/Bitbucket)
+              - Effect: Allow
+                Action:
+                  - codestar-connections:UseConnection
+                  - codestar-connections:GetConnection
+                Resource: "arn:aws:codeconnections:us-east-1:583966366465:connection/6e47d37e-a0ee-4046-855e-052c89fbfe46"
+                          
+
+
+
+
+  LibraryCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CodeBuildRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:s3:::${FrontendS3Bucket}/*
+                  - !Sub arn:aws:s3:::${FrontendS3Bucket}
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:CreateLogGroup
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - codepipeline:PutJobSuccessResult
+                  - codepipeline:PutJobFailureResult
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:PutImage
+                Resource: "*"
+      
+  LibraryCodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CodeDeployRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codedeploy.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: CodeDeployPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:Get*"
+                  - "s3:List*"
+                  - "ec2:DescribeInstances"
+                  - "ec2:DescribeInstanceStatus"
+                  - "ec2:DescribeTags"
+                  - "ec2:AssociateIamInstanceProfile"
+                  - "tag:GetResources"
+                  - "autoscaling:CompleteLifecycleAction"
+                  - "autoscaling:DeleteLifecycleHook"
+                  - "autoscaling:PutLifecycleHook"
+                  - "autoscaling:RecordLifecycleActionHeartbeat"
+                  - "autoscaling:DescribeAutoScalingGroups"
+                  - "autoscaling:DescribeLifecycleHooks"
+                  - "autoscaling:DescribeScalingActivities"
+                  - "autoscaling:DescribeNotificationConfigurations"
+                  - "codedeploy:RegisterApplicationRevision"
+                  - "codedeploy:CreateDeployment"
+                  - "codedeploy:GetDeployment"
+                  - "codedeploy:GetDeploymentConfig"
+                  - "codedeploy:GetApplication"
+                  - "codedeploy:GetApplicationRevision"
+                  - "codedeploy:ListDeploymentGroups"
+                  - "codedeploy:ListApplications"
+                  - "codedeploy:BatchGetDeployments"
+                Resource: "*"
+
+
+
+  # ✅ AWS CodePipeline (CI/CD)
+  LibraryCodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: LibraryPipeline
+      RoleArn: !GetAtt LibraryCodePipelineRole.Arn  # Replace with actual ARN
+      ArtifactStore:
+        Type: S3
+        Location: !Ref FrontendS3Bucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection  # ✅ Use AWS CodeStar instead of OAuth
+                Version: '1'
+              Configuration:
+                ConnectionArn: arn:aws:codeconnections:us-east-1:583966366465:connection/6e47d37e-a0ee-4046-855e-052c89fbfe46  # Replace with actual CodeStar connection ARN
+                FullRepositoryId: Sheshanadaf/lib-system
+                BranchName: main
+              OutputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+        - Name: Build
+          Actions:
+            - Name: BuildFrontend
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref LibraryCodeBuild
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              RunOrder: 2
+        
+            - Name: BuildBackend
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref LibraryCodeBuildBackend
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BackendBuildArtifact
+              RunOrder: 2
+
+        - Name: Deploy
+          Actions:
+            - Name: DeployToEC2
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CodeDeploy
+                Version: '1'
+              Configuration:
+                ApplicationName: !Ref LibraryCodeDeploy  # CodeDeploy App Name
+                DeploymentGroupName: !Ref LibraryDeploymentGroup  # Deployment Group
+              InputArtifacts:
+                - Name: BuildArtifact
+              RunOrder: 3
+
+            - Name: DeployBackend
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CodeDeploy
+                Version: '1'
+              Configuration:
+                ApplicationName: !Ref LibraryCodeDeployBackend
+                DeploymentGroupName: !Ref LibraryDeploymentGroupBackend
+              InputArtifacts:
+                - Name: BackendBuildArtifact
+              RunOrder: 3
+
+  # ✅ AWS CodeBuild (CI/CD Build Stage)
+  LibraryCodeBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: LibraryCodeBuild
+      ServiceRole: !GetAtt LibraryCodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |  # ✅ Moved inside Source block
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - cd my-project
+                - echo Installing dependencies...
+                - npm install
+            build:
+              commands:
+                - echo Building the React app...
+                - npm run build  # Use the Vite build command
+            post_build:
+              commands:
+                - echo "Listing build output files..."
+                - ls -a  # ✅ Recursively list files in the dist/ folder
+          artifacts:
+            files:
+              - 'my-project/**/*'
+
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        Type: LINUX_CONTAINER
+  
+  LibraryCodeBuildBackend:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: LibraryCodeBuildBackend
+      ServiceRole: !GetAtt LibraryCodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |  # ✅ Moved inside Source block
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - cd backend
+                - echo Installing dependencies...
+                - npm install
+            build:
+              commands:
+                - echo Building the React app...
+            post_build:
+              commands:
+                - echo "Zipping backend files..."
+                - zip -r backend.zip .
+                - ls -a  # ✅ Recursively list files in the dist/ folder
+          artifacts:
+            files:
+              - 'backend/**/*'
+
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        Type: LINUX_CONTAINER
+
+
+
+  # ✅ AWS CodeDeploy Application
+  LibraryCodeDeploy:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: LibraryApp
+
+  LibraryCodeDeployBackend:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: LibraryBackApp
+
+  # ✅ AWS CodeDeploy Deployment Group
+  LibraryDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref LibraryCodeDeploy
+      DeploymentGroupName: LibraryDeploymentGroup
+      ServiceRoleArn: !GetAtt LibraryCodeDeployRole.Arn  # Replace with actual ARN
+      DeploymentConfigName: CodeDeployDefault.AllAtOnce
+      Ec2TagFilters:
+        - Key: Name
+          Value: LibraryEC2
+          Type: KEY_AND_VALUE
+      AutoScalingGroups:
+        - !Ref AutoScalingGroup  # Attach Auto Scaling Group
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+          - DEPLOYMENT_STOP_ON_REQUEST
+      LoadBalancerInfo:
+        TargetGroupInfoList:
+          - Name: ALBTargetGroup  # Attach to ALB Target Group
+
+  LibraryDeploymentGroupBackend:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref LibraryCodeDeployBackend
+      DeploymentGroupName: LibraryDeploymentGroupBackend
+      ServiceRoleArn: !GetAtt LibraryCodeDeployRole.Arn  # Replace with actual ARN
+      DeploymentConfigName: CodeDeployDefault.AllAtOnce
+      Ec2TagFilters:
+        - Key: Name
+          Value: LibraryEC2ForBackEnd
+          Type: KEY_AND_VALUE
+      AutoScalingGroups:
+        - !Ref AutoScalingBackEndGroup  # Attach Auto Scaling Group
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+          - DEPLOYMENT_STOP_ON_REQUEST
+      LoadBalancerInfo:
+        TargetGroupInfoList:
+          - Name: ALBTargetBackendGroup  # Attach to ALB Target Group
+
+
+
+
+
+Outputs:
+  FrontendBucket:
+    Description: S3 Bucket for React frontend
+    Value: !Ref FrontendS3Bucket
+
+  ALBDNSName:
+    Description: Application Load Balancer DNS
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+
+  DynamoDBTableName:
+    Description: DynamoDB Table Name
+    Value: !Ref LibraryDynamoDB
+  
+  SNSTopicARN:
+    Description: ARN of the SNS topic
+    Value: !Ref CICDSNSTopic
+
+  LambdaFunctionARN:
+    Description: ARN of the Lambda function
+    Value: !GetAtt CICDNotificationLambda.Arn
