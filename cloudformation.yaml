@@ -549,7 +549,7 @@ Resources:
                 Action:
                   - codestar-connections:UseConnection
                   - codestar-connections:GetConnection
-                Resource: "arn:aws:codeconnections:us-east-1:583966366465:connection/6e47d37e-a0ee-4046-855e-052c89fbfe46"
+                Resource: "arn:aws:codeconnections:us-east-1:583966366465:connection/4a5c318e-9e42-49b0-b6b5-62cc9d006976"
                           
 
 
@@ -665,8 +665,8 @@ Resources:
                 Provider: CodeStarSourceConnection  # ✅ Use AWS CodeStar instead of OAuth
                 Version: '1'
               Configuration:
-                ConnectionArn: arn:aws:codeconnections:us-east-1:583966366465:connection/6e47d37e-a0ee-4046-855e-052c89fbfe46  # Replace with actual CodeStar connection ARN
-                FullRepositoryId: Sheshanadaf/lib-system
+                ConnectionArn: arn:aws:codeconnections:us-east-1:583966366465:connection/4a5c318e-9e42-49b0-b6b5-62cc9d006976  # Replace with actual CodeStar connection ARN
+                FullRepositoryId: Sheshanadaf/aws-library-sys
                 BranchName: main
               OutputArtifacts:
                 - Name: SourceArtifact
