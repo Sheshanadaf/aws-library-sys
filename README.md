@@ -4,7 +4,7 @@
 A scalable, secure, and highly available library management system deployed on AWS cloud infrastructure. The system features a modern web frontend, robust backend services, and automated CI/CD pipeline.
 
 ## Architecture
-![Architecture Diagram](corrected.png) #replace diagram img
+![Architecture Diagram](corrected.png)
 
 ### Key Components
 - **Frontend**: React-based web application
